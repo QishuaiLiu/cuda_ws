@@ -31,6 +31,32 @@ __global__ void matrixTranspose(const float* A, float* B, int cols, int rows) {
     }
 }
 
+template <int TILE_DIM, int BLOCK_ROWS>
+__global__ void transposeTiled(const float* __restrict__ A, float* __restrict__ B, int rows,
+                               int cols) {
+    __shared__ float tile[TILE_DIM][TILE_DIM + 1];
+
+    int x = blockIdx.x * TILE_DIM + threadIdx.x;
+    int y = blockIdx.y * TILE_DIM + threadIdx.y;
+
+    for (int j = 0; j < TILE_DIM; j += BLOCK_ROWS) {
+        if (x < cols && y + j < rows) {
+            tile[threadIdx.y + j][threadIdx.x] = A[(y + j) * cols + x];
+        }
+    }
+
+    __syncthreads();
+
+    x = blockIdx.y * TILE_DIM + threadIdx.x;
+    y = blockIdx.x * TILE_DIM + threadIdx.y;
+
+    for (int j = 0; j < TILE_DIM; j += BLOCK_ROWS) {
+        if (x < rows && y + j < cols) {
+            B[(y + j) * rows + x] = tile[threadIdx.x][threadIdx.y + j];
+        }
+    }
+}
+
 void printMatrixSample(const std::vector<float>& data, int rows, int cols) {
     int sample_rows = std::min(rows, 5);
     int sample_cols = std::min(cols, 5);
@@ -71,9 +97,15 @@ int main() {
     CUDA_CHECK(cudaMalloc(&d_B, output_bytes));
 
     CUDA_CHECK(cudaMemcpy(d_A, h_data.data(), input_bytes, cudaMemcpyHostToDevice));
-    dim3 block(16, 16);
-    dim3 grid((cols + block.x - 1) / block.x, (rows + block.y - 1) / block.y);
-    matrixTranspose<<<grid, block>>>(d_A, d_B, cols, rows);
+    // simple copy
+    // dim3 block(16, 16);
+    // dim3 grid((cols + block.x - 1) / block.x, (rows + block.y - 1) / block.y);
+    // matrixTranspose<<<grid, block>>>(d_A, d_B, cols, rows);
+    //
+    // tile version
+    dim3 block(32, 8);
+    dim3 grid((cols + block.x - 1) / block.x, (rows + block.x - 1) / block.x);
+    transposeTiled<32, 8><<<grid, block>>>(d_A, d_B, rows, cols);
 
     CUDA_CHECK(cudaGetLastError());
     CUDA_CHECK(cudaDeviceSynchronize());
