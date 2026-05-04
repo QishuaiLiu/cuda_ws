@@ -97,38 +97,75 @@ int main() {
     CUDA_CHECK(cudaMalloc(&d_B, output_bytes));
 
     CUDA_CHECK(cudaMemcpy(d_A, h_data.data(), input_bytes, cudaMemcpyHostToDevice));
-    // simple copy
-    // dim3 block(16, 16);
-    // dim3 grid((cols + block.x - 1) / block.x, (rows + block.y - 1) / block.y);
-    // matrixTranspose<<<grid, block>>>(d_A, d_B, rows, cols);
-    //
-    // tile version
+
     constexpr int TILE_DIM = 32;
     constexpr int BLOCK_ROWS = 8;
-    dim3 block(TILE_DIM, BLOCK_ROWS);
-    dim3 grid((cols + TILE_DIM - 1) / TILE_DIM, (rows + TILE_DIM - 1) / TILE_DIM);
-    transposeTiled<TILE_DIM, BLOCK_ROWS><<<grid, block>>>(d_A, d_B, rows, cols);
 
-    CUDA_CHECK(cudaGetLastError());
-    CUDA_CHECK(cudaDeviceSynchronize());
-    CUDA_CHECK(cudaMemcpy(h_transposed.data(), d_B, output_bytes, cudaMemcpyDeviceToHost));
+    dim3 baseline_block(32, 32);
+    dim3 baseline_grid((cols + baseline_block.x - 1) / baseline_block.x,
+                       (rows + baseline_block.y - 1) / baseline_block.y);
 
-    for (int r = 0; r < rows; ++r) {
-        for (int c = 0; c < cols; ++c) {
-            float expected = h_data[r * cols + c];
-            float actual = h_transposed[c * rows + r];
-            if (std::fabs(expected - actual) > 1.0e-5f) {
-                std::fprintf(stderr, "Mismatch at A(%d, %d): expected %f, got %f\n", r, c, expected,
-                             actual);
-                return EXIT_FAILURE;
+    dim3 tiled_block(TILE_DIM, BLOCK_ROWS);
+    dim3 tiled_grid((cols + TILE_DIM - 1) / TILE_DIM, (rows + TILE_DIM - 1) / TILE_DIM);
+
+    auto verify = [&](const char* name) {
+        CUDA_CHECK(cudaMemcpy(h_transposed.data(), d_B, output_bytes, cudaMemcpyDeviceToHost));
+        for (int r = 0; r < rows; ++r) {
+            for (int c = 0; c < cols; ++c) {
+                float expected = h_data[r * cols + c];
+                float actual = h_transposed[c * rows + r];
+                if (std::fabs(expected - actual) > 1.0e-5f) {
+                    std::fprintf(stderr, "%s: mismatch at A(%d, %d): expected %f, got %f\n", name,
+                                 r, c, expected, actual);
+                    std::exit(EXIT_FAILURE);
+                }
             }
         }
-    }
+    };
 
-    std::cout << "original A: " << rows << " x " << cols << std::endl;
+    constexpr int WARMUP_ITERS = 5;
+    constexpr int TIMED_ITERS = 100;
+
+    cudaEvent_t start, stop;
+    CUDA_CHECK(cudaEventCreate(&start));
+    CUDA_CHECK(cudaEventCreate(&stop));
+
+    auto bench = [&](const char* name, auto launch) {
+        for (int i = 0; i < WARMUP_ITERS; ++i) launch();
+        CUDA_CHECK(cudaGetLastError());
+        CUDA_CHECK(cudaDeviceSynchronize());
+
+        CUDA_CHECK(cudaEventRecord(start));
+        for (int i = 0; i < TIMED_ITERS; ++i) launch();
+        CUDA_CHECK(cudaEventRecord(stop));
+        CUDA_CHECK(cudaEventSynchronize(stop));
+
+        float total_ms = 0.0f;
+        CUDA_CHECK(cudaEventElapsedTime(&total_ms, start, stop));
+        float avg_ms = total_ms / TIMED_ITERS;
+        // transpose moves each element once read + once written
+        double gb = 2.0 * input_bytes / (1024.0 * 1024.0 * 1024.0);
+        double bw = gb / (avg_ms / 1000.0);
+        std::printf("%-20s avg %.3f ms   effective BW %.1f GiB/s\n", name, avg_ms, bw);
+
+        verify(name);
+    };
+
+    bench("baseline", [&] {
+        matrixTranspose<<<baseline_grid, baseline_block>>>(d_A, d_B, rows, cols);
+    });
+    bench("tiled (32x8)", [&] {
+        transposeTiled<TILE_DIM, BLOCK_ROWS>
+            <<<tiled_grid, tiled_block>>>(d_A, d_B, rows, cols);
+    });
+
+    CUDA_CHECK(cudaEventDestroy(start));
+    CUDA_CHECK(cudaEventDestroy(stop));
+
+    std::cout << "\noriginal A: " << rows << " x " << cols << std::endl;
     printMatrixSample(h_data, rows, cols);
 
-    std::cout << "\n Transposed B: " << cols << " x " << rows << std::endl;
+    std::cout << "\nTransposed B: " << cols << " x " << rows << std::endl;
     printMatrixSample(h_transposed, cols, rows);
     std::cout << "\nTranspose check passed." << std::endl;
 
