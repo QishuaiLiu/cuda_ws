@@ -22,7 +22,7 @@ __global__ void hello_kernel() {
     std::printf("Hello from CUDA block %d, thread %d\n", blockIdx.x, threadIdx.x);
 }
 
-__global__ void matrixTranspose(const float* A, float* B, int cols, int rows) {
+__global__ void matrixTranspose(const float* A, float* B, int rows, int cols) {
     int col_idx = blockIdx.x * blockDim.x + threadIdx.x;
     int row_idx = blockIdx.y * blockDim.y + threadIdx.y;
 
@@ -100,12 +100,14 @@ int main() {
     // simple copy
     // dim3 block(16, 16);
     // dim3 grid((cols + block.x - 1) / block.x, (rows + block.y - 1) / block.y);
-    // matrixTranspose<<<grid, block>>>(d_A, d_B, cols, rows);
+    // matrixTranspose<<<grid, block>>>(d_A, d_B, rows, cols);
     //
     // tile version
-    dim3 block(32, 8);
-    dim3 grid((cols + block.x - 1) / block.x, (rows + block.x - 1) / block.x);
-    transposeTiled<32, 8><<<grid, block>>>(d_A, d_B, rows, cols);
+    constexpr int TILE_DIM = 32;
+    constexpr int BLOCK_ROWS = 8;
+    dim3 block(TILE_DIM, BLOCK_ROWS);
+    dim3 grid((cols + TILE_DIM - 1) / TILE_DIM, (rows + TILE_DIM - 1) / TILE_DIM);
+    transposeTiled<TILE_DIM, BLOCK_ROWS><<<grid, block>>>(d_A, d_B, rows, cols);
 
     CUDA_CHECK(cudaGetLastError());
     CUDA_CHECK(cudaDeviceSynchronize());
