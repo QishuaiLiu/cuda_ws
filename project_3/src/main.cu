@@ -1,12 +1,11 @@
 #include <cuda_runtime.h>
 
 #include <algorithm>
-#include <random>
-#include <iostream>
-
 #include <cstdio>
 #include <cstdlib>
 #include <iostream>
+#include <random>
+#include <vector>
 
 #define CUDA_CHECK(call)                                                          \
     do {                                                                          \
@@ -34,7 +33,34 @@ __global__ void arraySum(float* A, float* result, int size) {
     if (threadIdx.x == 0) {
         result[blockIdx.x] = A[i];
     }
+}
 
+__global__ void sharedArraySum(float* A, float* result, int size) {
+    __shared__ float sdata[256];
+
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    int tid = threadIdx.x;
+    // step 1:
+    // sdata[tid] = (i < size) ? A[i] : 0.0f;
+    float sum = 0.f;
+    while (i < size) {
+        sum += A[i];
+        i += blockDim.x * gridDim.x;
+    }
+    sdata[tid] = sum;
+    __syncthreads();
+
+    // step 2:
+    for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
+        if (tid < stride) {
+            sdata[tid] += sdata[tid + stride];
+        }
+        __syncthreads();
+    }
+    // step 3:
+    if (tid == 0) {
+        result[blockIdx.x] = sdata[0];
+    }
 }
 
 int main() {
@@ -42,7 +68,7 @@ int main() {
     CUDA_CHECK(cudaGetLastError());
     CUDA_CHECK(cudaDeviceSynchronize());
 
-    int size = 1 << 20; // 1 million elements
+    int size = 1 << 20;  // 1 million elements
     size_t bytes = size * sizeof(float);
 
     std::vector<float> h_data(size);
@@ -56,18 +82,30 @@ int main() {
         h_data[i] = dist(gen);
     }
 
-    float* d_data, * d_result;
+    float *d_data, *d_result, *d_partial;
     CUDA_CHECK(cudaMalloc(&d_data, bytes));
-    CUDA_CHECK(cudaMalloc(&d_result, sizeof(float) * 1)); // Assuming max
+    CUDA_CHECK(cudaMalloc(&d_result, sizeof(float) * 1));  // Assuming max
 
     CUDA_CHECK(cudaMemcpy(d_data, h_data.data(), bytes, cudaMemcpyHostToDevice));
 
     int blockSize = 256;
     int gridSize = (size + blockSize - 1) / blockSize;
-    arraySum<<<gridSize, blockSize>>>(d_data, d_result, size);
+
+    std::vector<float> h_partial(gridSize);
+    CUDA_CHECK(cudaMalloc(&d_partial, sizeof(float) * gridSize));
+
+    // arraySum<<<gridSize, blockSize>>>(d_data, d_result, size);
+
+    // CUDA_CHECK(cudaMemcpy(&h_result, d_result, sizeof(float), cudaMemcpyDeviceToHost));
+
+    sharedArraySum<<<gridSize, blockSize>>>(d_data, d_partial, size);
+    sharedArraySum<<<1, blockSize>>>(d_partial, d_result, gridSize);
 
     CUDA_CHECK(cudaMemcpy(&h_result, d_result, sizeof(float), cudaMemcpyDeviceToHost));
 
+    CUDA_CHECK(cudaFree(d_data));
+    CUDA_CHECK(cudaFree(d_result));
+    CUDA_CHECK(cudaFree(d_partial));
     printf("Sum of array: %f\n", h_result);
 
     std::cout << "project_3 CUDA starter finished." << std::endl;
