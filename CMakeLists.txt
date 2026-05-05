@@ -12,3 +12,4 @@ project(cuda_ws LANGUAGES CXX CUDA)
 
 add_subdirectory(project_1)
 add_subdirectory(project_2)
+add_subdirectory(project_3)
