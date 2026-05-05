@@ -4,6 +4,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <iostream>
+#include <numeric>
 #include <random>
 #include <vector>
 
@@ -36,7 +37,8 @@ __global__ void arraySum(float* A, float* result, int size) {
 }
 
 __global__ void sharedArraySum(float* A, float* result, int size) {
-    __shared__ float sdata[256];
+    // __shared__ float sdata[256];
+    extern __shared__ float sdata[];
 
     int i = blockIdx.x * blockDim.x + threadIdx.x;
     int tid = threadIdx.x;
@@ -82,31 +84,78 @@ int main() {
         h_data[i] = dist(gen);
     }
 
-    float *d_data, *d_result, *d_partial;
-    CUDA_CHECK(cudaMalloc(&d_data, bytes));
-    CUDA_CHECK(cudaMalloc(&d_result, sizeof(float) * 1));  // Assuming max
-
-    CUDA_CHECK(cudaMemcpy(d_data, h_data.data(), bytes, cudaMemcpyHostToDevice));
-
-    int blockSize = 256;
+    int blockSize = 512;
     int gridSize = (size + blockSize - 1) / blockSize;
 
-    std::vector<float> h_partial(gridSize);
+    float *d_data, *d_data_backup, *d_result, *d_partial;
+    CUDA_CHECK(cudaMalloc(&d_data, bytes));
+    CUDA_CHECK(cudaMalloc(&d_data_backup, bytes));
+    CUDA_CHECK(cudaMalloc(&d_result, sizeof(float) * 1));
     CUDA_CHECK(cudaMalloc(&d_partial, sizeof(float) * gridSize));
 
-    // arraySum<<<gridSize, blockSize>>>(d_data, d_result, size);
+    CUDA_CHECK(cudaMemcpy(d_data, h_data.data(), bytes, cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(d_data_backup, d_data, bytes, cudaMemcpyDeviceToDevice));
 
-    // CUDA_CHECK(cudaMemcpy(&h_result, d_result, sizeof(float), cudaMemcpyDeviceToHost));
+    constexpr int WARMUP_ITERS = 5;
+    constexpr int TIMED_ITERS = 100;
 
-    sharedArraySum<<<gridSize, blockSize>>>(d_data, d_partial, size);
-    sharedArraySum<<<1, blockSize>>>(d_partial, d_result, gridSize);
+    cudaEvent_t start, stop;
+    CUDA_CHECK(cudaEventCreate(&start));
+    CUDA_CHECK(cudaEventCreate(&stop));
 
+    double gb = (double)bytes / (1024.0 * 1024.0 * 1024.0);
+
+    auto bench = [&](const char* name, auto launch, bool destructive) {
+        if (destructive)
+            CUDA_CHECK(cudaMemcpy(d_data, d_data_backup, bytes, cudaMemcpyDeviceToDevice));
+        for (int i = 0; i < WARMUP_ITERS; ++i) launch();
+        CUDA_CHECK(cudaGetLastError());
+        CUDA_CHECK(cudaDeviceSynchronize());
+
+        if (destructive)
+            CUDA_CHECK(cudaMemcpy(d_data, d_data_backup, bytes, cudaMemcpyDeviceToDevice));
+        CUDA_CHECK(cudaEventRecord(start));
+        for (int i = 0; i < TIMED_ITERS; ++i) launch();
+        CUDA_CHECK(cudaEventRecord(stop));
+        CUDA_CHECK(cudaEventSynchronize(stop));
+
+        float total_ms = 0.0f;
+        CUDA_CHECK(cudaEventElapsedTime(&total_ms, start, stop));
+        float avg_ms = total_ms / TIMED_ITERS;
+        double bw = gb / (avg_ms / 1000.0);
+        std::printf("%-20s avg %.3f ms   effective BW %.1f GiB/s\n", name, avg_ms, bw);
+    };
+
+    bench(
+        "arraySum", [&] { arraySum<<<gridSize, blockSize>>>(d_data, d_partial, size); },
+        /*destructive=*/true);
+
+    size_t shared_bytes = blockSize * sizeof(float);
+    bench(
+        "sharedArraySum",
+        [&] {
+            sharedArraySum<<<gridSize, blockSize, shared_bytes>>>(d_data, d_partial, size);
+        },
+        /*destructive=*/false);
+
+    CUDA_CHECK(cudaEventDestroy(start));
+    CUDA_CHECK(cudaEventDestroy(stop));
+
+    // Final correctness run: full two-pass reduction on clean data
+    CUDA_CHECK(cudaMemcpy(d_data, d_data_backup, bytes, cudaMemcpyDeviceToDevice));
+    sharedArraySum<<<gridSize, blockSize, shared_bytes>>>(d_data, d_partial, size);
+    sharedArraySum<<<1, blockSize, shared_bytes>>>(d_partial, d_result, gridSize);
+    CUDA_CHECK(cudaGetLastError());
+    CUDA_CHECK(cudaDeviceSynchronize());
     CUDA_CHECK(cudaMemcpy(&h_result, d_result, sizeof(float), cudaMemcpyDeviceToHost));
 
+    float cpu_sum = std::accumulate(h_data.begin(), h_data.end(), 0.0f);
+    std::printf("GPU sum: %f   CPU sum: %f\n", h_result, cpu_sum);
+
     CUDA_CHECK(cudaFree(d_data));
+    CUDA_CHECK(cudaFree(d_data_backup));
     CUDA_CHECK(cudaFree(d_result));
     CUDA_CHECK(cudaFree(d_partial));
-    printf("Sum of array: %f\n", h_result);
 
     std::cout << "project_3 CUDA starter finished." << std::endl;
     return 0;
