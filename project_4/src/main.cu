@@ -38,7 +38,7 @@ int main() {
     std::vector<unsigned int> h_pixels(num_pixels);
     std::vector<unsigned int> h_result(256);
     std::mt19937 ng(123);
-    std::uniform_real_distribution<float> dist(0, 255);
+    std::uniform_int_distribution<int> dist(0, 255);
 
     for (int y = 0; y < height; ++y) {
         for (int x = 0; x < width; ++x) {
@@ -47,21 +47,27 @@ int main() {
     }
 
     unsigned int *d_pixels = nullptr, *d_result = nullptr;
-    cudaMalloc(&d_pixels, num_pixels * sizeof(unsigned int));
-    cudaMalloc(&d_result, 256 * sizeof(unsigned int));
-    cudaMemset(d_result, 0, 256 * sizeof(unsigned int));
-    cudaMemcpy(d_pixels, h_pixels.data(), num_pixels * sizeof(unsigned int),
-               cudaMemcpyHostToDevice);
+    CUDA_CHECK(cudaMalloc(&d_pixels, num_pixels * sizeof(unsigned int)));
+    CUDA_CHECK(cudaMalloc(&d_result, 256 * sizeof(unsigned int)));
+    CUDA_CHECK(cudaMemset(d_result, 0, 256 * sizeof(unsigned int)));
+    CUDA_CHECK(cudaMemcpy(d_pixels, h_pixels.data(), num_pixels * sizeof(unsigned int),
+                          cudaMemcpyHostToDevice));
 
     int block_size = 256;
     int grid_size = (num_pixels + (block_size - 1)) / block_size;
 
     histogramGlobal<<<grid_size, block_size>>>(d_pixels, d_result, num_pixels);
-    cudaMemcpy(h_result.data(), d_result, 256 * sizeof(unsigned int), cudaMemcpyDeviceToHost);
+    CUDA_CHECK(cudaGetLastError());
+    CUDA_CHECK(cudaDeviceSynchronize());
+    CUDA_CHECK(cudaMemcpy(h_result.data(), d_result, 256 * sizeof(unsigned int),
+                          cudaMemcpyDeviceToHost));
 
-    for (int i = 0; i < h_result.size(); ++i) {
+    for (size_t i = 0; i < h_result.size(); ++i) {
         std::cout << i << " : " << h_result[i] << "\n";
     }
+
+    CUDA_CHECK(cudaFree(d_pixels));
+    CUDA_CHECK(cudaFree(d_result));
 
     std::cout << "project_4 CUDA starter finished." << std::endl;
     return 0;
