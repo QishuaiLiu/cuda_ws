@@ -27,6 +27,28 @@ __global__ void histogramGlobal(const unsigned int* pixels, unsigned int* hist, 
     }
 }
 
+__global__ void histogramShared(const unsigned int* pixels, unsigned int* hist, int n) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    __shared__ int local_hist[256];
+
+    if (threadIdx.x < 256) {
+        local_hist[threadIdx.x] = 0;
+    }
+
+    __syncthreads();
+
+    if (idx < n) {
+        int value = pixels[idx];
+        atomicAdd(&local_hist[value], 1);
+    }
+
+    __syncthreads();
+
+    for (int i = threadIdx.x; i < 256; i += blockDim.x) {
+        atomicAdd(&hist[i], local_hist[i]);
+    }
+}
+
 int main() {
     hello_kernel<<<2, 4>>>();
     CUDA_CHECK(cudaGetLastError());
@@ -56,11 +78,12 @@ int main() {
     int block_size = 256;
     int grid_size = (num_pixels + (block_size - 1)) / block_size;
 
-    histogramGlobal<<<grid_size, block_size>>>(d_pixels, d_result, num_pixels);
+    // histogramGlobal<<<grid_size, block_size>>>(d_pixels, d_result, num_pixels);
+    histogramShared<<<grid_size, block_size>>>(d_pixels, d_result, num_pixels);
     CUDA_CHECK(cudaGetLastError());
     CUDA_CHECK(cudaDeviceSynchronize());
-    CUDA_CHECK(cudaMemcpy(h_result.data(), d_result, 256 * sizeof(unsigned int),
-                          cudaMemcpyDeviceToHost));
+    CUDA_CHECK(
+        cudaMemcpy(h_result.data(), d_result, 256 * sizeof(unsigned int), cudaMemcpyDeviceToHost));
 
     for (size_t i = 0; i < h_result.size(); ++i) {
         std::cout << i << " : " << h_result[i] << "\n";
