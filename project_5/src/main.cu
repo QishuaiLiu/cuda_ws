@@ -1,5 +1,6 @@
 #include <cuda_runtime.h>
 
+#include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <iostream>
@@ -111,23 +112,63 @@ int main() {
     dim3 block(TILE, TILE);
     dim3 grid((N + block.x - 1) / block.x, (M + block.y - 1) / block.y);
 
-    // matrixMultiplication<<<grid, block>>>(d_first, d_second, d_result, M, K, N);
-    matrixMultiplicationTiled<<<grid, block>>>(d_first, d_second, d_result, M, K, N);
+    constexpr int WARMUP_ITERS = 5;
+    constexpr int TIMED_ITERS = 50;
 
-    CUDA_CHECK(
-        cudaMemcpy(h_result.data(), d_result, M * N * sizeof(float), cudaMemcpyHostToDevice));
+    cudaEvent_t start, stop;
+    CUDA_CHECK(cudaEventCreate(&start));
+    CUDA_CHECK(cudaEventCreate(&stop));
 
-    int row = 2, col = 3;
-    float cpu_sum = 0.0f;
-    for (int k = 0; k < K; ++k) {
-        cpu_sum += h_first_matrix[row * K + k] * h_second_matrix[k * N + col];
-    }
+    auto verify = [&](const char* name) {
+        CUDA_CHECK(cudaMemcpy(h_result.data(), d_result, M * N * sizeof(float),
+                              cudaMemcpyDeviceToHost));
+        int row = 2, col = 3;
+        float cpu_sum = 0.0f;
+        for (int k = 0; k < K; ++k) {
+            cpu_sum += h_first_matrix[row * K + k] * h_second_matrix[k * N + col];
+        }
+        float gpu_val = h_result[row * N + col];
+        std::printf("%-20s CPU %f GPU %f diff %f\n", name, cpu_sum, gpu_val,
+                    std::fabs(cpu_sum - gpu_val));
+    };
 
-    float gpu_val = h_result[row * N + col];
-    printf("CPU: %f GPU: %f diff %f\n", cpu_sum, gpu_val, fabs(cpu_sum - gpu_val));
+    double gflop = 2.0 * static_cast<double>(M) * N * K / 1e9;
 
-    CUDA_CHECK(cudaGetLastError());
-    CUDA_CHECK(cudaDeviceSynchronize());
+    auto bench = [&](const char* name, auto launch) {
+        for (int i = 0; i < WARMUP_ITERS; ++i) launch();
+        CUDA_CHECK(cudaGetLastError());
+        CUDA_CHECK(cudaDeviceSynchronize());
+
+        CUDA_CHECK(cudaEventRecord(start));
+        for (int i = 0; i < TIMED_ITERS; ++i) launch();
+        CUDA_CHECK(cudaEventRecord(stop));
+        CUDA_CHECK(cudaEventSynchronize(stop));
+
+        float total_ms = 0.0f;
+        CUDA_CHECK(cudaEventElapsedTime(&total_ms, start, stop));
+        float avg_ms = total_ms / TIMED_ITERS;
+        double gflops = gflop / (avg_ms / 1000.0);
+        std::printf("%-20s avg %.3f ms   %.1f GFLOP/s\n", name, avg_ms, gflops);
+
+        launch();
+        CUDA_CHECK(cudaGetLastError());
+        CUDA_CHECK(cudaDeviceSynchronize());
+        verify(name);
+    };
+
+    bench("naive matmul", [&] {
+        matrixMultiplication<<<grid, block>>>(d_first, d_second, d_result, M, K, N);
+    });
+    bench("tiled matmul", [&] {
+        matrixMultiplicationTiled<<<grid, block>>>(d_first, d_second, d_result, M, K, N);
+    });
+
+    CUDA_CHECK(cudaEventDestroy(start));
+    CUDA_CHECK(cudaEventDestroy(stop));
+
+    CUDA_CHECK(cudaFree(d_first));
+    CUDA_CHECK(cudaFree(d_second));
+    CUDA_CHECK(cudaFree(d_result));
 
     std::cout << "project_5 CUDA starter finished." << std::endl;
     return 0;
