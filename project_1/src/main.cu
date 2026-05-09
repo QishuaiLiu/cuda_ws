@@ -7,6 +7,8 @@
 #include <random>
 #include <vector>
 
+#include "vector_add.h"
+
 #define CUDA_CHECK(call)                                                          \
     do {                                                                          \
         cudaError_t err = (call);                                                 \
@@ -21,20 +23,12 @@ __global__ void hello_kernel() {
     std::printf("Hello from CUDA block %d, thread %d\n", blockIdx.x, threadIdx.x);
 }
 
-__global__ void addTwoVector(const float* a, const float* b, float* c, int size) {
-    int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    if (idx < size) {
-        c[idx] = a[idx] + b[idx];
-    }
-}
-
 int main() {
     hello_kernel<<<2, 4>>>();
     CUDA_CHECK(cudaGetLastError());
     CUDA_CHECK(cudaDeviceSynchronize());
 
     int size = 1000;
-    size_t bytes = size * sizeof(float);
     std::vector<float> h_data_a(size);
     std::vector<float> h_data_b(size);
     std::vector<float> h_data_c(size);
@@ -48,23 +42,7 @@ int main() {
         h_data_b[i] = dist(gen);
     }
 
-    float *d_first_data = nullptr, *d_second_data = nullptr, *d_result_data = nullptr;
-    CUDA_CHECK(cudaMalloc(&d_first_data, bytes));
-    CUDA_CHECK(cudaMalloc(&d_second_data, bytes));
-    CUDA_CHECK(cudaMalloc(&d_result_data, bytes));
-
-    CUDA_CHECK(cudaMemcpy(d_first_data, h_data_a.data(), bytes, cudaMemcpyHostToDevice));
-    CUDA_CHECK(cudaMemcpy(d_second_data, h_data_b.data(), bytes, cudaMemcpyHostToDevice));
-
-    int threads = 256;
-    int blocks = (size + threads - 1) / threads;
-
-    addTwoVector<<<blocks, threads>>>(d_first_data, d_second_data, d_result_data, size);
-
-    CUDA_CHECK(cudaGetLastError());
-    CUDA_CHECK(cudaDeviceSynchronize());
-
-    CUDA_CHECK(cudaMemcpy(h_data_c.data(), d_result_data, bytes, cudaMemcpyDeviceToHost));
+    p1::vector_add(h_data_a.data(), h_data_b.data(), h_data_c.data(), size);
 
     for (int i = 0; i < size; ++i) {
         const float expected = h_data_a[i] + h_data_b[i];
@@ -77,10 +55,6 @@ int main() {
     for (int i = 0; i < 5; ++i) {
         std::cout << h_data_a[i] << " + " << h_data_b[i] << " = " << h_data_c[i] << std::endl;
     }
-
-    CUDA_CHECK(cudaFree(d_first_data));
-    CUDA_CHECK(cudaFree(d_second_data));
-    CUDA_CHECK(cudaFree(d_result_data));
 
     return 0;
 }
