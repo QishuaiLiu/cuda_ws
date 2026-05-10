@@ -74,6 +74,81 @@ __global__ void matrixMultiplicationTiled(const float* __restrict__ A, const flo
     return;
 }
 
+template <int BM, int BN, int BK, int TM, int TN>
+__global__ void matrixMultiplicationRegTiled(const float* __restrict__ A,
+                                             const float* __restrict__ B, float* C, int M, int K,
+                                             int N) {
+    constexpr int threadsPerBlock = (BM / TM) * (BN / TN);
+
+    __shared__ float s_A[BM][BK];
+    __shared__ float s_B[BK][BN];
+
+    int blockRow = blockIdx.y * BM;
+    int blockCol = blockIdx.x * BN;
+    int tid = threadIdx.y * blockDim.x + threadIdx.x;
+
+    // Each thread owns a TM x TN tile of C inside the block tile.
+    int threadRow = (tid / (BN / TN)) * TM;
+    int threadCol = (tid % (BN / TN)) * TN;
+
+    float c_reg[TM][TN] = {0.0f};
+    float a_reg[TM];
+    float b_reg[TN];
+
+    constexpr int aLoadsPerThread = (BM * BK) / threadsPerBlock;
+    constexpr int bLoadsPerThread = (BK * BN) / threadsPerBlock;
+
+    for (int t = 0; t < (K + BK - 1) / BK; ++t) {
+        // Cooperative load of A tile (BM rows x BK cols) into shared memory.
+#pragma unroll
+        for (int i = 0; i < aLoadsPerThread; ++i) {
+            int idx = i * threadsPerBlock + tid;
+            int r = idx / BK;
+            int c = idx % BK;
+            int gr = blockRow + r;
+            int gc = t * BK + c;
+            s_A[r][c] = (gr < M && gc < K) ? A[gr * K + gc] : 0.0f;
+        }
+        // Cooperative load of B tile (BK rows x BN cols).
+#pragma unroll
+        for (int i = 0; i < bLoadsPerThread; ++i) {
+            int idx = i * threadsPerBlock + tid;
+            int r = idx / BN;
+            int c = idx % BN;
+            int gr = t * BK + r;
+            int gc = blockCol + c;
+            s_B[r][c] = (gr < K && gc < N) ? B[gr * N + gc] : 0.0f;
+        }
+        __syncthreads();
+
+#pragma unroll
+        for (int k = 0; k < BK; ++k) {
+#pragma unroll
+            for (int i = 0; i < TM; ++i) a_reg[i] = s_A[threadRow + i][k];
+#pragma unroll
+            for (int j = 0; j < TN; ++j) b_reg[j] = s_B[k][threadCol + j];
+#pragma unroll
+            for (int i = 0; i < TM; ++i) {
+#pragma unroll
+                for (int j = 0; j < TN; ++j) {
+                    c_reg[i][j] += a_reg[i] * b_reg[j];
+                }
+            }
+        }
+        __syncthreads();
+    }
+
+#pragma unroll
+    for (int i = 0; i < TM; ++i) {
+#pragma unroll
+        for (int j = 0; j < TN; ++j) {
+            int gr = blockRow + threadRow + i;
+            int gc = blockCol + threadCol + j;
+            if (gr < M && gc < N) C[gr * N + gc] = c_reg[i][j];
+        }
+    }
+}
+
 int main() {
     hello_kernel<<<2, 4>>>();
     CUDA_CHECK(cudaGetLastError());
@@ -83,7 +158,7 @@ int main() {
 
     std::uniform_real_distribution<float> dist(0.0f, 10.f);
 
-    int M = 745, K = 1024, N = 525;
+    int M = 2048, K = 2048, N = 2048;
 
     std::vector<float> h_first_matrix(M * K);
     std::vector<float> h_second_matrix(K * N);
@@ -120,8 +195,8 @@ int main() {
     CUDA_CHECK(cudaEventCreate(&stop));
 
     auto verify = [&](const char* name) {
-        CUDA_CHECK(cudaMemcpy(h_result.data(), d_result, M * N * sizeof(float),
-                              cudaMemcpyDeviceToHost));
+        CUDA_CHECK(
+            cudaMemcpy(h_result.data(), d_result, M * N * sizeof(float), cudaMemcpyDeviceToHost));
         int row = 2, col = 3;
         float cpu_sum = 0.0f;
         for (int k = 0; k < K; ++k) {
@@ -156,11 +231,18 @@ int main() {
         verify(name);
     };
 
-    bench("naive matmul", [&] {
-        matrixMultiplication<<<grid, block>>>(d_first, d_second, d_result, M, K, N);
-    });
+    bench("naive matmul",
+          [&] { matrixMultiplication<<<grid, block>>>(d_first, d_second, d_result, M, K, N); });
     bench("tiled matmul", [&] {
         matrixMultiplicationTiled<<<grid, block>>>(d_first, d_second, d_result, M, K, N);
+    });
+
+    constexpr int RT_BM = 128, RT_BN = 128, RT_BK = 8, RT_TM = 8, RT_TN = 8;
+    dim3 rtBlock((RT_BN / RT_TN), (RT_BM / RT_TM));  // 16 x 16 = 256 threads
+    dim3 rtGrid((N + RT_BN - 1) / RT_BN, (M + RT_BM - 1) / RT_BM);
+    bench("reg-tiled matmul", [&] {
+        matrixMultiplicationRegTiled<RT_BM, RT_BN, RT_BK, RT_TM, RT_TN>
+            <<<rtGrid, rtBlock>>>(d_first, d_second, d_result, M, K, N);
     });
 
     CUDA_CHECK(cudaEventDestroy(start));
