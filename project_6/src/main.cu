@@ -20,13 +20,12 @@
 #define PROJECT_6_OUTPUT_DIR "."
 #endif
 
-__constant__ float d_filter[5][5];
-#define TILE 16
+constexpr int TILE = 16;
+constexpr int FILTER_R = 2;
+constexpr int FILTER_SIZE = 2 * FILTER_R + 1;
+[[maybe_unused]] constexpr int SHARED = TILE + 2 * FILTER_R;
 
-int FILTER_R = 2;                          // radius — 5×5 filter
-const int FILTER_SIZE = 2 * FILTER_R + 1;  // = 5
-
-const int SHARED = TILE + 2 * FILTER_R;
+__constant__ float d_filter[FILTER_SIZE][FILTER_SIZE];
 
 #define CUDA_CHECK(call)                                                          \
     do {                                                                          \
@@ -68,15 +67,16 @@ int main() {
     const std::string input_path = std::string(PROJECT_6_ASSET_DIR) + "/sample.png";
     int width = 0;
     int height = 0;
-    int channels = 0;
-    unsigned char* image = stbi_load(input_path.c_str(), &width, &height, &channels, 0);
+    int source_channels = 0;
+    constexpr int channels = 1;
+    unsigned char* image = stbi_load(input_path.c_str(), &width, &height, &source_channels, channels);
     if (image == nullptr) {
         std::fprintf(stderr, "Failed to load %s: %s\n", input_path.c_str(), stbi_failure_reason());
         return EXIT_FAILURE;
     }
 
-    std::cout << "Loaded image: " << input_path << " (" << width << "x" << height << ", "
-              << channels << " channels)" << std::endl;
+    std::cout << "Loaded grayscale image: " << input_path << " (" << width << "x" << height
+              << ", source channels " << source_channels << ")" << std::endl;
 
     const std::string output_path = std::string(PROJECT_6_OUTPUT_DIR) + "/sample_copy.png";
     if (stbi_write_png(output_path.c_str(), width, height, channels, image, width * channels) ==
@@ -85,18 +85,17 @@ int main() {
         stbi_image_free(image);
         return EXIT_FAILURE;
     }
-    stbi_image_free(image);
-
     hello_kernel<<<2, 4>>>();
     CUDA_CHECK(cudaGetLastError());
     CUDA_CHECK(cudaDeviceSynchronize());
 
     int size = width * height;
-    std::vector<float> h_input(size), h_output(size), h_cpu_output(size);
+    std::vector<float> h_input(size), h_output(size);
 
     for (int i = 0; i < size; ++i) {
         h_input[i] = static_cast<float>(image[i]) / 255.0f;
     }
+    stbi_image_free(image);
 
     float h_filter[FILTER_SIZE][FILTER_SIZE] = {{1, 4, 7, 4, 1},
                                                 {4, 16, 26, 16, 4},
@@ -110,23 +109,40 @@ int main() {
             h_filter[i][j] /= 273.0f;
         }
 
-    cudaMemcpyToSymbol(d_filter, h_filter, FILTER_SIZE * FILTER_SIZE * sizeof(float));
+    CUDA_CHECK(cudaMemcpyToSymbol(d_filter, h_filter, FILTER_SIZE * FILTER_SIZE * sizeof(float)));
     float *d_input, *d_output;
 
-    cudaMalloc(&d_input, size * sizeof(float));
-    cudaMalloc(&d_output, size * sizeof(float));
+    CUDA_CHECK(cudaMalloc(&d_input, size * sizeof(float)));
+    CUDA_CHECK(cudaMalloc(&d_output, size * sizeof(float)));
 
-    cudaMemcpy(d_input, h_input.data(), size * sizeof(float), cudaMemcpyHostToDevice);
+    CUDA_CHECK(cudaMemcpy(d_input, h_input.data(), size * sizeof(float), cudaMemcpyHostToDevice));
 
     dim3 blockDim(TILE, TILE);
     dim3 gridDim((width + TILE - 1) / TILE, (height + TILE - 1) / TILE);
 
     convKernel<<<gridDim, blockDim>>>(d_input, d_output, width, height);
+    CUDA_CHECK(cudaGetLastError());
+    CUDA_CHECK(cudaDeviceSynchronize());
 
-    cudaMemcpy(h_output.data(), d_output, size * sizeof(float), cudaMemcpyDeviceToHost);
+    CUDA_CHECK(cudaMemcpy(h_output.data(), d_output, size * sizeof(float), cudaMemcpyDeviceToHost));
 
-    std::vector<unsigned int> out_img(size);
-    stbi_write_png("output.png", width, height, 1, out_img.data(), width);
+    std::vector<unsigned char> out_img(size);
+    for (int i = 0; i < size; ++i) {
+        float value = h_output[i];
+        value = (value < 0.0f) ? 0.0f : ((value > 1.0f) ? 1.0f : value);
+        out_img[i] = static_cast<unsigned char>(value * 255.0f + 0.5f);
+    }
+
+    const std::string conv_output_path = std::string(PROJECT_6_OUTPUT_DIR) + "/output.png";
+    if (stbi_write_png(conv_output_path.c_str(), width, height, 1, out_img.data(), width) == 0) {
+        std::fprintf(stderr, "Failed to write %s\n", conv_output_path.c_str());
+        CUDA_CHECK(cudaFree(d_input));
+        CUDA_CHECK(cudaFree(d_output));
+        return EXIT_FAILURE;
+    }
+
+    CUDA_CHECK(cudaFree(d_input));
+    CUDA_CHECK(cudaFree(d_output));
 
     std::cout << "project_6 CUDA starter finished." << std::endl;
     return 0;
