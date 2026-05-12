@@ -1,5 +1,6 @@
 #include <cuda_runtime.h>
 
+#include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <iostream>
@@ -63,13 +64,45 @@ __global__ void convKernel(const float* input, float* output, int width, int hei
     output[row * width + col] = sum;
 }
 
+__global__ void convKernelShared(const float* __restrict__ input, float* output, int width,
+                                 int height) {
+    __shared__ float sdata[SHARED][SHARED];
+
+    for (int i = threadIdx.y; i < SHARED; i += blockDim.y) {
+        for (int j = threadIdx.x; j < SHARED; j += blockDim.x) {
+            int r = i + blockIdx.y * TILE - FILTER_R;
+            int c = j + blockIdx.x * TILE - FILTER_R;
+
+            r = max(0, min(r, height - 1));
+            c = max(0, min(c, width - 1));
+            sdata[i][j] = input[r * width + c];
+        }
+    }
+    __syncthreads();
+
+    int col = blockIdx.x * TILE + threadIdx.x;
+    int row = blockIdx.y * TILE + threadIdx.y;
+
+    if (col < width && row < height) {
+        float sum = 0.0f;
+
+        for (int fr = 0; fr < FILTER_SIZE; fr++) {
+            for (int fc = 0; fc < FILTER_SIZE; fc++) {
+                sum += sdata[threadIdx.y + fr][threadIdx.x + fc] * d_filter[fr][fc];
+            }
+        }
+        output[row * width + col] = sum;
+    }
+}
+
 int main() {
     const std::string input_path = std::string(PROJECT_6_ASSET_DIR) + "/sample.png";
     int width = 0;
     int height = 0;
     int source_channels = 0;
     constexpr int channels = 1;
-    unsigned char* image = stbi_load(input_path.c_str(), &width, &height, &source_channels, channels);
+    unsigned char* image =
+        stbi_load(input_path.c_str(), &width, &height, &source_channels, channels);
     if (image == nullptr) {
         std::fprintf(stderr, "Failed to load %s: %s\n", input_path.c_str(), stbi_failure_reason());
         return EXIT_FAILURE;
@@ -120,11 +153,68 @@ int main() {
     dim3 blockDim(TILE, TILE);
     dim3 gridDim((width + TILE - 1) / TILE, (height + TILE - 1) / TILE);
 
-    convKernel<<<gridDim, blockDim>>>(d_input, d_output, width, height);
-    CUDA_CHECK(cudaGetLastError());
-    CUDA_CHECK(cudaDeviceSynchronize());
+    constexpr int WARMUP_ITERS = 5;
+    constexpr int TIMED_ITERS = 100;
 
-    CUDA_CHECK(cudaMemcpy(h_output.data(), d_output, size * sizeof(float), cudaMemcpyDeviceToHost));
+    cudaEvent_t start, stop;
+    CUDA_CHECK(cudaEventCreate(&start));
+    CUDA_CHECK(cudaEventCreate(&stop));
+
+    auto clamp_index = [](int value, int limit) {
+        if (value < 0) return 0;
+        if (value >= limit) return limit - 1;
+        return value;
+    };
+
+    auto verify = [&](const char* name) {
+        CUDA_CHECK(cudaMemcpy(h_output.data(), d_output, size * sizeof(float), cudaMemcpyDeviceToHost));
+        int row = height / 2;
+        int col = width / 2;
+        float cpu_sum = 0.0f;
+        for (int fr = -FILTER_R; fr <= FILTER_R; ++fr) {
+            for (int fc = -FILTER_R; fc <= FILTER_R; ++fc) {
+                int r = clamp_index(row + fr, height);
+                int c = clamp_index(col + fc, width);
+                cpu_sum += h_input[r * width + c] * h_filter[fr + FILTER_R][fc + FILTER_R];
+            }
+        }
+        float gpu_val = h_output[row * width + col];
+        std::printf("%-20s CPU %.6f GPU %.6f diff %.6f\n", name, cpu_sum, gpu_val,
+                    std::fabs(cpu_sum - gpu_val));
+    };
+
+    double gflop = 2.0 * static_cast<double>(size) * FILTER_SIZE * FILTER_SIZE / 1e9;
+
+    auto bench = [&](const char* name, auto launch) {
+        for (int i = 0; i < WARMUP_ITERS; ++i) launch();
+        CUDA_CHECK(cudaGetLastError());
+        CUDA_CHECK(cudaDeviceSynchronize());
+
+        CUDA_CHECK(cudaEventRecord(start));
+        for (int i = 0; i < TIMED_ITERS; ++i) launch();
+        CUDA_CHECK(cudaEventRecord(stop));
+        CUDA_CHECK(cudaEventSynchronize(stop));
+
+        float total_ms = 0.0f;
+        CUDA_CHECK(cudaEventElapsedTime(&total_ms, start, stop));
+        float avg_ms = total_ms / TIMED_ITERS;
+        double gflops = gflop / (avg_ms / 1000.0);
+        std::printf("%-20s avg %.3f ms   %.1f GFLOP/s\n", name, avg_ms, gflops);
+
+        launch();
+        CUDA_CHECK(cudaGetLastError());
+        CUDA_CHECK(cudaDeviceSynchronize());
+        verify(name);
+    };
+
+    bench("global conv",
+          [&] { convKernel<<<gridDim, blockDim>>>(d_input, d_output, width, height); });
+    bench("shared conv", [&] {
+        convKernelShared<<<gridDim, blockDim>>>(d_input, d_output, width, height);
+    });
+
+    CUDA_CHECK(cudaEventDestroy(start));
+    CUDA_CHECK(cudaEventDestroy(stop));
 
     std::vector<unsigned char> out_img(size);
     for (int i = 0; i < size; ++i) {
