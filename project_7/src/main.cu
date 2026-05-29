@@ -32,13 +32,13 @@ __global__ void prefixSum(const float* __restrict__ input, float* result, int si
 
     for (int i = 1; i < blockDim.x; i *= 2) {
         float val = 0;
-        if (idx > i) {
+        if (idx >= i) {
             val = sdata[idx - i];
         }
         __syncthreads();
 
-        if (idx > i) {
-            sdata[i] += val;
+        if (idx >= i) {
+            sdata[idx] += val;
         }
 
         __syncthreads();
@@ -77,7 +77,7 @@ int main() {
     // dim3 grid_dim(size + (block_dim.x - 1) / block_dim.x);
     prefixSum<<<1, size>>>(d_data, d_result, size);
 
-    cudaMemcpy(h_result.data(), d_result, sizeof(float), cudaMemcpyDeviceToHost);
+    cudaMemcpy(h_result.data(), d_result, size * sizeof(float), cudaMemcpyDeviceToHost);
 
     std::cout << "project_7 initialized successfully" << std::endl;
     return 0;
